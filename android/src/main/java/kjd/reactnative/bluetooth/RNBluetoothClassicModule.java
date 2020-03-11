@@ -16,18 +16,23 @@ import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.LifecycleEventListener;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
+import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
-import com.facebook.react.modules.core.DeviceEventManagerModule;
 
 import java.lang.reflect.Method;
+import java.nio.charset.Charset;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.annotation.Nullable;
+
+import kjd.reactnative.CommonCharsets;
+import kjd.reactnative.RCTEventEmitter;
 
 /**
  * Provides bridge between native Android functionality and React Native javascript.  Provides
@@ -56,16 +61,29 @@ import javax.annotation.Nullable;
  */
 public class RNBluetoothClassicModule
         extends ReactContextBaseJavaModule
-        implements ActivityEventListener, LifecycleEventListener {
+        implements ActivityEventListener,
+            LifecycleEventListener,
+            RCTEventEmitter,
+            BluetoothEventListener {
 
-  private static final String TAG = "BluetoothClassicModule";
+  private static final String TAG = RNBluetoothClassicModule.class.getSimpleName();
 
   private static final boolean D = BuildConfig.DEBUG;
 
+  /**
+   * Android {@link BluetoothAdapter} responsible for communication.
+   */
   private BluetoothAdapter mBluetoothAdapter;
 
+  /**
+   * Responsible for connection and communication with specific device.
+   */
   private RNBluetoothClassicService mBluetoothService;
 
+  /**
+   * React Native application context.  Allows for event management and listening within the React
+   * Native environment.
+   */
   private ReactApplicationContext mReactContext;
 
   /**
@@ -73,26 +91,7 @@ public class RNBluetoothClassicModule
    * an event to the ReactNative emitter based on the new state.
    * https://developer.android.com/reference/android/bluetooth/BluetoothAdapter#ACTION_STATE_CHANGED
    */
-  final BroadcastReceiver mBluetoothStateReceiver = new BroadcastReceiver() {
-    @Override
-    public void onReceive(Context context, Intent intent) {
-      final String action = intent.getAction();
-
-      if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)) {
-        final int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
-        switch (state) {
-          case BluetoothAdapter.STATE_OFF:
-            if (D) Log.d(TAG, "Bluetooth was disabled");
-            sendEvent(BluetoothEvent.BLUETOOTH_DISABLED.code, null);
-            break;
-          case BluetoothAdapter.STATE_ON:
-            if (D) Log.d(TAG, "Bluetooth was enabled");
-            sendEvent(BluetoothEvent.BLUETOOTH_ENABLED.code, null);
-            break;
-        }
-      }
-    }
-  };
+  private final BroadcastReceiver mBluetoothStateReceiver = new BluetoothStateReceiver(this);
 
   /**
    * Intent receiver responsible for handling changes to Bluetooth connections.  This Intent is
@@ -100,21 +99,10 @@ public class RNBluetoothClassicModule
    * to the ReactNative emitter containing the state and deviceId which was connected.
    * https://developer.android.com/reference/android/bluetooth/BluetoothAdapter#ACTION_CONNECTION_STATE_CHANGED
    */
-  final BroadcastReceiver mBluetoothConnectionReceiver = new BroadcastReceiver() {
-    @Override
-    public void onReceive(Context context, Intent intent) {
-      final String action = intent.getAction();
-
-      if (BluetoothDevice.ACTION_ACL_DISCONNECT_REQUESTED.equals(action)) {
-        final BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-        if (D) Log.d(TAG, "Device connected: " + device.toString());
-        sendEvent(BluetoothEvent.BLUETOOTH_DISCONNECTED.code,  deviceToWritableMap(device));
-      }
-    }
-  };
+  private final BroadcastReceiver mBluetoothConnectionReceiver = new BluetoothConnectionReceiver(this);
 
   /**
-   * Delimeter used while reading.  It's possible the buffer may contain more than a single message
+   * Delimiter used while reading.  It's possible the buffer may contain more than a single message
    * when this occurs, the specified mDelimiter will be used to split, and cause multiple read
    * events.  With manual reading, the last instance of the mDelimiter will be used.  For example
    * if sending the command {@code ri} to retrieve the Reader Information, then a number of lines
@@ -125,7 +113,21 @@ public class RNBluetoothClassicModule
   private String mDelimiter;
 
   /**
-   * Used to read/write data from the Connected bluetooth device.
+   * Default charset for Bluetooth communication.  Defaults to LATIN / ISO_8859_1 as it was in
+   * the original react-native-bluetooth-serial project.  This can be set using the
+   *
+   */
+  private Charset mCharset;
+
+  /**
+   * Whether there are BTEvent.READ listeners on the NativeEventEmitter.js side of things.  This
+   * will control whether the onData method passes through to NativeEventEmitter.js
+   */
+  private AtomicBoolean mReadObserving = new AtomicBoolean(false);
+
+  /**
+   * Used to read/write data from the Connected bluetooth device.  This should eventually be moved
+   * into the RNBluetoothClassicService to create a more similar pattern to IOS.
    */
   private StringBuffer mBuffer = new StringBuffer();
 
@@ -142,6 +144,12 @@ public class RNBluetoothClassicModule
   private Promise mConnectedPromise;
 
   /**
+   * Resolve or reject accept request.  Due to the request needing to start a new Intent
+   * and wait for the Activity result, the Promise must be maintained.
+   */
+  private Promise mAcceptPromise;
+
+  /**
    * Resolve or reject requested discovery.  Due to the request needing to start a new Intent
    * and wait for the Activity result, the Promise must be maintained.
    */
@@ -154,16 +162,32 @@ public class RNBluetoothClassicModule
   private Promise mPairDevicePromise;
 
   /**
-   * Creates a new RNBluetoothClassicModule.  Attempts to get the BluetoothAdapter from the
-   * Android system and initialize the RNBluetoothClassicService.  Finally sends appropriate
-   * events to Javascript and registers itself for the appropriate Android events.
+   * Creates a new RNBluetoothClassicModule using the standard delimiter and charset.
    *
    * @param reactContext react native context
    */
   public RNBluetoothClassicModule(ReactApplicationContext reactContext) {
+    this(reactContext, "\n", CommonCharsets.LATIN.charset());
+  }
+
+  /**
+   * Creates a new {@link RNBluetoothClassicModule} with a custom default delimiter and charset.
+   * Attempts to get the BluetoothAdapter from the Android system and initialize the
+   * {@link RNBluetoothClassicService}.  Finally sends appropriate events to Javascript and registers
+   * itself for the appropriate Android events.
+   *
+   * @param reactContext React Native context
+   * @param delimiter default delimiter
+   * @param charset default charset
+   */
+  public RNBluetoothClassicModule(ReactApplicationContext reactContext,
+                                  String delimiter,
+                                  Charset charset) {
     super(reactContext);
+
     this.mReactContext = reactContext;
-    this.mDelimiter = "\n";
+    this.mDelimiter = delimiter;
+    this.mCharset = charset;
 
     if (mBluetoothAdapter == null) {
       mBluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
@@ -196,9 +220,9 @@ public class RNBluetoothClassicModule
   @Nullable
   @Override
   public Map<String, Object> getConstants() {
-    Map<String, Object> constants = super.getConstants();
-    if (constants == null) constants = new HashMap<>();
+    Map<String,Object> constants = new HashMap<>();
     constants.put("BTEvents", BluetoothEvent.eventNames());
+    constants.put("BTCharsets", CommonCharsets.asMap());
     return constants;
   }
 
@@ -251,23 +275,6 @@ public class RNBluetoothClassicModule
   @Override
   public void onNewIntent(Intent intent) {
     if (D) Log.d(TAG, "On new Intent: " + intent.getAction());
-  }
-
-  /**
-   * Send event to javascript.
-   * <p>
-   * TODO pull this into it's own class incase the library gets extended
-   *
-   * @param eventName Name of the event
-   * @param params Additional params
-   */
-  private void sendEvent(String eventName, @Nullable WritableMap params) {
-    if (mReactContext.hasActiveCatalystInstance()) {
-      if (D) Log.d(TAG, String.format("Sending event [%s] with data [%s]", eventName, params));
-      mReactContext
-              .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-              .emit(eventName, params);
-    }
   }
 
   @Override
@@ -343,7 +350,7 @@ public class RNBluetoothClassicModule
     if (mBluetoothAdapter != null) {
       Set<BluetoothDevice> bondedDevices = mBluetoothAdapter.getBondedDevices();
       for (BluetoothDevice rawDevice : bondedDevices) {
-        WritableMap device = deviceToWritableMap(rawDevice);
+        WritableMap device = RNUtils.deviceToWritableMap(rawDevice);
         deviceList.pushMap(device);
       }
     }
@@ -352,9 +359,10 @@ public class RNBluetoothClassicModule
   }
 
   /**
-   * Attempt to discover unpaired devices.
+   * Attempt to discover unpaired devices.  Resolves when the BluetoothDiscoveryReceiver
+   * returns.
    *
-   * @param promise
+   * @param promise resolve or reject the request to discoverDevices
    */
   @ReactMethod
   public void discoverDevices(final Promise promise) {
@@ -371,9 +379,11 @@ public class RNBluetoothClassicModule
   }
 
   /**
-   * Attempts to cancel the discovery process.
+   * Attempts to cancel the discovery process.  Cancel request is always resolved as true at this
+   * point, which may need to be changed, but for now whether anything happens or not it's
+   * seen as successful.
    *
-   * @param promise
+   * @param promise resolves cancel request
    */
   @ReactMethod
   public void cancelDiscovery(final Promise promise) {
@@ -391,8 +401,8 @@ public class RNBluetoothClassicModule
    * Attempts to pair to the requested device Id - retrieves the device from the BluetoothAdapter
    * and attempts the pairing.
    *
-   * @param id
-   * @param promise
+   * @param id the Id of the BluetoothDevice to which we are pairing
+   * @param promise resolves when the BluetoothDevice is paired, rejects if there are any issues
    */
   @ReactMethod
   public void pairDevice(String id, Promise promise) {
@@ -429,7 +439,7 @@ public class RNBluetoothClassicModule
    * and I don't particularly see a purpose for it now.  It would be better off having a general
    * purpose listener that will let us know when any device has just bonded.
    *
-   * @param device Device
+   * @param device BluetoothDevice to which we are pairing
    *
    */
   private void pairDevice(BluetoothDevice device) throws DevicePairingException {
@@ -502,14 +512,53 @@ public class RNBluetoothClassicModule
   public void connect(String id, Promise promise) {
     mConnectedPromise = promise;
     if (mBluetoothAdapter != null) {
-      BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(id);
-      if (device != null) {
-        mBluetoothService.connect(device);
-      } else {
-        promise.reject(new Exception("No device found with id " + id));
+      try {
+        BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(id);
+        if (device != null) {
+          mBluetoothService.connect(device);
+        } else {
+          promise.reject(new Exception("No device found with id " + id));
+        }
+      } catch (Exception e) {
+        promise.reject(new Exception("Unable to connect to device"));
+        Log.e(TAG, "Unable to connect to device", e);
+        onError(e);
       }
     } else {
       promise.reject(new Exception("BluetoothAdapter is not enabled"));
+    }
+  }
+
+   /**
+   * Start listening for connections
+   *
+   * @param promise resolve or reject the requested listening
+   */
+  @ReactMethod
+  public void accept(Promise promise) {
+    mAcceptPromise = promise;
+    if (mBluetoothAdapter != null) {
+        mBluetoothService.accept();
+    } else {
+      promise.reject(new Exception("BluetoothAdapter is not enabled"));
+    }   
+  }
+
+  /**
+   * Cancel the listening request.  Returns gracefully with a null {@link BluetoothDevice} to be
+   * managed, once the error handling gets a little bit of love, there will be a difference
+   * between a BluetoothAcceptCancelException and an actual error.
+   * @param promise
+   */
+  @ReactMethod
+  public void cancelAccept(Promise promise) {
+    if (mAcceptPromise != null) {
+      mBluetoothService.cancelAccept();
+      mAcceptPromise.resolve(null);
+      mAcceptPromise = null;
+      promise.resolve(true);
+    } else {
+      promise.reject(new Exception("Currently not in accept mode"));
     }
   }
 
@@ -537,7 +586,7 @@ public class RNBluetoothClassicModule
   @ReactMethod
   public void getConnectedDevice(Promise promise) {
     if (mBluetoothService.isConnected()) {
-      promise.resolve(deviceToWritableMap(mBluetoothService.connectedDevice()));
+      promise.resolve(RNUtils.deviceToWritableMap(mBluetoothService.connectedDevice()));
     }
     promise.reject(new Error("No bluetooth device connected"));
   }
@@ -562,7 +611,7 @@ public class RNBluetoothClassicModule
    * mDelimiter.  Note - there will never be data within the buffer if the application is currently
    * registered to receive read events.
    *
-   * @param promise
+   * @param promise resolves with data, could be null or 0 length
    */
   @ReactMethod
   public void readFromDevice(Promise promise) {
@@ -577,8 +626,9 @@ public class RNBluetoothClassicModule
    * Attempts to read from the device buffer - until the first instance of the mDelimiter.  Allows
    * for a different mDelimiter to be used than what was originally registered.
    *
-   * @param delimiter
-   * @param promise
+   * @param delimiter the delimiter to use for parsing this request, in case a one time delimiter
+   *                  is required.
+   * @param promise resolves with data, could be null or 0 length
    */
   @ReactMethod
   public void readUntilDelimiter(String delimiter, Promise promise) {
@@ -586,20 +636,10 @@ public class RNBluetoothClassicModule
   }
 
   /**
-   * Attempts to read from the device buffer - using the registered delimiter.
-   *
-   * @param promise
-   */
-  @ReactMethod
-  public void readUntilDelimiter(Promise promise) {
-    promise.resolve(readUntil(mDelimiter));
-  }
-
-  /**
    * Sets a new delimiter.
    *
-   * @param delimiter
-   * @param promise
+   * @param delimiter the new delimiter to be used for parsing buffer
+   * @param promise resolves true
    */
   @ReactMethod
   public void setDelimiter(String delimiter, Promise promise) {
@@ -608,9 +648,39 @@ public class RNBluetoothClassicModule
   }
 
   /**
+   * Sets the default charset for subsequent connections.
+   *
+   * @param code charset code to which we attempt to set the default
+   * @param promise resolves if the code successfully set, rejects if the code is not known
+   */
+  @ReactMethod
+  public void setEncoding(String code, Promise promise) {
+    try {
+      this.mCharset = CommonCharsets.valueOf(code).charset();
+      promise.resolve(true);
+    } catch(EnumConstantNotPresentException e) {
+      promise.reject(e);
+    }
+  }
+
+  /**
+   * Configures whether or not we are Observing read events.  Would have liked to use start/stop
+   * Observing, but that would require overriding both Android and IOS, as well as possibly
+   * affecting future functionality.
+   *
+   * @param readObserving whether React Native has a READ listener
+   * @param promise resolves true
+   */
+  @ReactMethod
+  public void setReadObserving(boolean readObserving, Promise promise) {
+    this.mReadObserving.set(readObserving);
+    promise.resolve(true);
+  }
+
+  /**
    * Clears the buffer.
    *
-   * @param promise
+   * @param promise resolves true
    */
   @ReactMethod
   public void clear(Promise promise) {
@@ -619,20 +689,22 @@ public class RNBluetoothClassicModule
   }
 
   /**
-   * Gets the available information within the buffer.
-   * @param promise
+   * Gets the available information within the buffer.  There is no concept of the delimiter in
+   * this request - which may need to be changed - since in most cases I can see a full message
+   * needing to be available.
+   *
+   * @param promise resolves with length of buffer, could be 0
    */
   @ReactMethod
   public void available(Promise promise) {
     promise.resolve(mBuffer.length());
   }
 
-
   /**
    * Attempts to set the BluetoothAdapter name.
    *
-   * @param newName
-   * @param promise
+   * @param newName the name to which the adapter will be changed
+   * @param promise resolves true
    */
   @ReactMethod
   public void setAdapterName(String newName, Promise promise) {
@@ -642,62 +714,55 @@ public class RNBluetoothClassicModule
     promise.resolve(true);
   }
 
-  /**
-   * Resolves the successful connection by returning the Device which was just connected to.
-   *
-   * @param device the device to which the connection was successful
-   */
-  void onConnectionSuccess(BluetoothDevice device) {
+  @Override
+  public void onConnectionSuccess(BluetoothDevice device) {
     // Global device connection events have been moved to the BLUETOOTH_CONNECTED event which is
     // now a module registration.  I don't see it making sense to return a module event as well
     // as a resolved promise, since this should only ever be called after a request to a specific
     // device.
-    //sendEvent(BluetoothEvent.CONNECTION_SUCCESS.code, null);
+    sendEvent(BluetoothEvent.CONNECTION_SUCCESS.code, RNUtils.deviceToWritableMap(device));
     if (mConnectedPromise != null) {
-      mConnectedPromise.resolve(deviceToWritableMap(device));
+      mConnectedPromise.resolve(RNUtils.deviceToWritableMap(device));
     }
+    if (mAcceptPromise != null) {
+      mAcceptPromise.resolve(RNUtils.deviceToWritableMap(device));
+    }
+    mConnectedPromise = null;
+    mAcceptPromise = null;
+  }
+
+  @Override
+  public void onConnectionFailed(BluetoothDevice device, Throwable reason) {
+    String msg = String.format("Connection to device %s has failed", device.getName());
+    Log.d(this.getClass().getSimpleName(),  msg, reason);
+
+    if (mConnectedPromise != null) {
+      mConnectedPromise.reject(new Exception("Connection unsuccessful"), RNUtils.deviceToWritableMap(device));
+    }
+
     mConnectedPromise = null;
   }
 
-  /**
-   * Rejects the connection attempt by
-   *
-   * @param device the device to which the connection was failed
-   */
-  void onConnectionFailed(BluetoothDevice device) {
-    // Global device connection events have been moved to the BLUETOOTH_DISCONNECTED event which is
-    // now a module registration.  I don't see it making sense to return a module event as well
-    // as a resolved promise, since this should only ever be called after a request to a specific
-    // device.
-    //sendEvent(BluetoothEvent.CONNECTION_FAILED.code, null);
-    if (mConnectedPromise != null) {
-      mConnectedPromise.reject(new Exception("Connection unsuccessful"), deviceToWritableMap(device));
-    }
-    mConnectedPromise = null;
-  }
+  @Override
+  public void onConnectionLost (BluetoothDevice device, Throwable reason) {
+    String msg = String.format("Connection to device %s was lost", device.getName());
+    Log.d(this.getClass().getSimpleName(),  msg, reason);
 
-  /**
-   * Handle lost connection.  Unlike connectionSuccess and connectionFailed it is important
-   * that we manage a lost connection, as we may want to ensure it's still connected (bonded)
-   * and then re-connect (socket) to it.
-   *
-   * @param device the Device to which the connecion was lost
-   */
-  void onConnectionLost (BluetoothDevice device) {
     WritableMap params = Arguments.createMap();
-    params.putMap("device", deviceToWritableMap(device));
-    params.putString("message", "Connection unsuccessful");
+    params.putMap("device", RNUtils.deviceToWritableMap(device));
+    params.putString("message", msg);
+    params.putString("error", reason.getMessage());
     sendEvent(BluetoothEvent.CONNECTION_LOST.code, params);
   }
 
-  /**
-   * Handle error.
-   *
-   * @param e Exception
-   */
-  void onError (Exception e) {
+  @Override
+  public void onError (Throwable e) {
+    Log.e(this.getClass().getSimpleName(), e.getMessage(), e);
+
     WritableMap params = Arguments.createMap();
     params.putString("message", e.getMessage());
+    params.putString("error", e.getMessage());
+    params.putMap("device", RNUtils.deviceToWritableMap(mBluetoothService.connectedDevice()));
     sendEvent(BluetoothEvent.ERROR.code, params);
   }
 
@@ -716,25 +781,32 @@ public class RNBluetoothClassicModule
    *
    * @param data Message
    */
-  void onData (String data) {
-    if (D) Log.d(TAG, String.format("Data received [%s]", data));
+  @Override
+  public void onReceivedData(BluetoothDevice device, byte[] data) {
+    String msg = String.format("Received %d bytes from device %s", data.length, device.getName());
+    Log.d(TAG, msg);
 
-    mBuffer.append(data);
+    mBuffer.append(new String(data, mCharset));
 
-    String message = null;
+    if (!mReadObserving.get()) {
+      Log.d(TAG, "No BTEvent.READ listeners are registered, skipping handling of the event");
+      return;
+    }
+
+    String message;
     while ((message = readUntil(this.mDelimiter)) != null) {
       BluetoothMessage bluetoothMessage
-              = new BluetoothMessage<String>(deviceToWritableMap(mBluetoothService.connectedDevice()), message);
+              = new BluetoothMessage<>(RNUtils.deviceToWritableMap(mBluetoothService.connectedDevice()), message);
       sendEvent(BluetoothEvent.READ.code, bluetoothMessage.asMap());
     }
   }
 
   /**
    * Attempts to read from to the first (or if none end) delimiter.  If the delimiter is found
-   * then the data is retreived and removed from the buffer.
+   * then the data is retrieved and removed from the buffer.
    *
-   * @param delimiter
-   * @return
+   * @param delimiter value to use as the reading delimiter
+   * @return the data up to the next delimiter
    */
   private String readUntil(String delimiter) {
     String data = null;
@@ -745,24 +817,6 @@ public class RNBluetoothClassicModule
       mBuffer.delete(0, len);
     }
     return data;
-  }
-
-  /**
-   * Convert BluetoothDevice into WritableMap.
-   *
-   * @param device Bluetooth device
-   */
-  private WritableMap deviceToWritableMap(BluetoothDevice device) {
-    WritableMap params = Arguments.createMap();
-
-    params.putString("name", device.getName());
-    params.putString("address", device.getAddress());
-    params.putString("id", device.getAddress());
-
-    // Extra Android specific details
-    params.putInt("class", device.getBluetoothClass() != null
-            ? device.getBluetoothClass().getDeviceClass() : -1);
-    return params;
   }
 
   /**
@@ -826,7 +880,6 @@ public class RNBluetoothClassicModule
             try {
               mReactContext.unregisterReceiver(this);
             } catch (Exception e) {
-              Log.e(TAG, "Cannot unregister receiver", e);
               onError(e);
             }
           } else if (state == BluetoothDevice.BOND_NONE && prevState == BluetoothDevice.BOND_BONDED){
@@ -867,7 +920,7 @@ public class RNBluetoothClassicModule
 
         if (BluetoothDevice.ACTION_FOUND.equals(action)) {
           BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-          WritableMap d = deviceToWritableMap(device);
+          WritableMap d = RNUtils.deviceToWritableMap(device);
           unpairedDevices.pushMap(d);
         } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
           if (D) Log.d(TAG, "Discovery finished");
@@ -889,4 +942,8 @@ public class RNBluetoothClassicModule
     mReactContext.registerReceiver(deviceDiscoveryReceiver, intentFilter);
   }
 
+  @Override
+  public ReactContext getReactContext() {
+    return mReactContext;
+  }
 }

@@ -3,11 +3,19 @@ package kjd.reactnative.bluetooth;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothSocket;
+import android.bluetooth.BluetoothServerSocket;
 import android.util.Log;
 
+import java.io.*;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
+import java.util.Arrays;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import kjd.reactnative.CommonCharsets;
 
 /**
  * Provides the communication threads and message delivering/handling for a single connected
@@ -38,6 +46,11 @@ public class RNBluetoothClassicService {
     private ConnectThread mConnectThread;
 
     /**
+     * Thread responsible for acepting connection
+     */
+    private AcceptThread mAcceptThread;
+
+    /**
      * Communication thread takes over once ConnectThread has successfully handed off.
      */
     private ConnectedThread mConnectedThread;
@@ -45,7 +58,7 @@ public class RNBluetoothClassicService {
     /**
      * Allows for communication of incoming data
      */
-    private RNBluetoothClassicModule mModule;
+    private BluetoothEventListener listener;
 
     /**
      * Current connection state
@@ -53,36 +66,29 @@ public class RNBluetoothClassicService {
     private DeviceState mState;
 
     /**
-     * Character set used for communications.
+     * The Android {@link BluetoothDevice} to which this service is communicating.
      */
-    private final String mCharSet;
-
     private BluetoothDevice mDevice;
 
     /**
      * Constructor. Prepares a new RNBluetoothClassicService session.
      *
-     * @param module which is responsible for handling communication
+     * @param listener data received listener
      */
-    RNBluetoothClassicService(RNBluetoothClassicModule module, String charSet) {
+    RNBluetoothClassicService(BluetoothEventListener listener) {
         this.mAdapter = BluetoothAdapter.getDefaultAdapter();
         this.mState = DeviceState.DISCONNECTED;
-        this.mModule = module;
-        this.mCharSet = charSet;
+        this.listener = listener;
         this.mDevice = null;
-    }
-
-    RNBluetoothClassicService(RNBluetoothClassicModule module) {
-        this(module, "ISO-8859-1");
     }
 
     /**
      * Start the ConnectThread to initiate a connection to a remote device.
      *
-     * @param device the Bluetooth device to which the connection will be made
+     * @param device {@link BluetoothDevice} to which we are connecting.
      */
     synchronized void connect(BluetoothDevice device) {
-        if (D) Log.d(TAG, "Connect to: " + device);
+        if (D) Log.d(TAG, String.format("Connecting to %s", device.getName()));
 
         if (DeviceState.CONNECTING.equals(mState)) {
             cancelConnectThread(); // Cancel any thread attempting to make a connection
@@ -96,6 +102,26 @@ public class RNBluetoothClassicService {
 
         // Unsure about whether to set device while just connecting
         setState(DeviceState.CONNECTING, null);
+    }
+
+
+    /**
+     * Start the AcceptThread to wait for a connection from a remote device.
+     *
+     *
+     */
+
+    synchronized void accept() {
+        if (D) Log.d(TAG, "Start accept:");
+        // Start the thread to accept connection attempts
+        mAcceptThread = new AcceptThread();
+        mAcceptThread.start();
+    }
+
+    synchronized void cancelAccept() {
+        if (D) Log.d(TAG, "Cancelling accept:");
+        mAcceptThread.cancel();
+
     }
 
     /**
@@ -180,7 +206,7 @@ public class RNBluetoothClassicService {
         mConnectedThread = new ConnectedThread(device, socket);
         mConnectedThread.start();
 
-        mModule.onConnectionSuccess(device);
+        listener.onConnectionSuccess(device);
         setState(DeviceState.CONNECTED, device);
     }
 
@@ -190,16 +216,16 @@ public class RNBluetoothClassicService {
      *
      * @param device to which the connection was attempted
      */
-    private void connectionFailed(BluetoothDevice device) {
-        mModule.onConnectionFailed(device); // Send a failure message
+    private void connectionFailed(BluetoothDevice device, Throwable e) {
+        listener.onConnectionFailed(device, e); // Send a failure message
         RNBluetoothClassicService.this.stop(); // Start the service over to restart listening mode
     }
 
     /**
      * Indicate that the connection was lost and notify the UI Activity.
      */
-    private void connectionLost(BluetoothDevice device) {
-        mModule.onConnectionLost(device);  // Send a failure message
+    private void connectionLost(BluetoothDevice device, Throwable e) {
+        listener.onConnectionLost(device, e);  // Send a failure message
         RNBluetoothClassicService.this.stop(); // Start the service over to restart listening mode
     }
 
@@ -239,22 +265,22 @@ public class RNBluetoothClassicService {
         private final BluetoothDevice mmDevice;
 
         ConnectThread(BluetoothDevice device) {
-            mmDevice = device;
+            setName("ConnectThread");
+
+            this.mmDevice = device;
             BluetoothSocket tmp = null;
 
             // Get a BluetoothSocket for a connection with the given BluetoothDevice
             try {
                 tmp = device.createRfcommSocketToServiceRecord(UUID_SPP);
             } catch (Exception e) {
-                mModule.onError(e);
-                Log.e(TAG, "Socket create() failed", e);
+                listener.onConnectionFailed(device, e);
             }
             mmSocket = tmp;
         }
 
         public void run() {
-            if (D) Log.d(TAG, "BEGIN mConnectThread");
-            setName("ConnectThread");
+            Log.d(TAG, "BEGIN mConnectThread");
 
             // Always cancel discovery because it will slow down a connection
             mAdapter.cancelDiscovery();
@@ -262,25 +288,26 @@ public class RNBluetoothClassicService {
             // Make a connection to the BluetoothSocket
             try {
                 // This is a blocking call and will only return on a successful connection or an exception
-                if (D) Log.d(TAG,String.format("Connecting to socket %s", mmDevice.getAddress()));
+                Log.d(TAG,String.format("Connecting to socket %s", mmDevice.getAddress()));
+
                 mmSocket.connect();
-            } catch (Exception e) {
+            } catch (Exception connectException) {
                 // Some 4.1 devices have problems, try an alternative way to connect
                 // See https://github.com/don/RCTBluetoothSerialModule/issues/89
                 try {
                     Log.i(TAG,"Trying fallback...");
-                    mmSocket = (BluetoothSocket) mmDevice.getClass().getMethod("createRfcommSocket", new Class[] {int.class}).invoke(mmDevice,1);
+                    mmSocket = (BluetoothSocket)
+                            mmDevice.getClass().getMethod("createRfcommSocket", new Class[] {int.class})
+                                    .invoke(mmDevice,1);
                     mmSocket.connect();
-                } catch (Exception e2) {
-                    Log.e(TAG, "Couldn't establish a Bluetooth connection.");
+                } catch (Exception socketException) {
                     try {
                         mmSocket.close();
-                    } catch (Exception e3) {
-                        Log.e(TAG, "Unable to close() socket during connection failure", e3);
-                        mModule.onError(e3);
+                    } catch (Exception e1) {
+                        // Ignore and handle below
                     }
 
-                    connectionFailed(mmDevice);
+                    connectionFailed(mmDevice, socketException);
                     return;
                 }
             } finally {
@@ -303,10 +330,82 @@ public class RNBluetoothClassicService {
                 mmSocket.close();
             } catch (Exception e) {
                 Log.e(TAG, "close() of connect socket failed", e);
-                mModule.onError(e);
+                listener.onError(e);
             }
         }
     }
+
+    /**
+     * A cancellable thread used for waiting for client connections.  There is currently no timeout,
+     * but the request can be cancelled (albeit not pretty) it seems to be working.
+     *
+     * @author tpettrov
+     */
+
+    private class AcceptThread extends Thread {
+        private final BluetoothServerSocket mmServerSocket;
+        private AtomicBoolean cancelled = new AtomicBoolean(false);
+
+        public AcceptThread() {
+            // Use a temporary object that is later assigned to mmServerSocket
+            // because mmServerSocket is final.
+            BluetoothServerSocket tmp = null;
+            try {
+                // MY_UUID is the app's UUID string, also used by the client code.
+                tmp = mAdapter.listenUsingRfcommWithServiceRecord("RNBluetoothClassic", UUID_SPP);
+            } catch (IOException e) {
+                Log.e(TAG, "Socket's accept() method failed", e);
+                listener.onError(e);
+            }
+            mmServerSocket = tmp;
+        }
+
+        public void run() {
+            BluetoothSocket socket = null;
+            BluetoothDevice device = null;
+            // Keep listening until exception occurs or a socket is returned.
+            while (true) {
+                try {
+                    socket = mmServerSocket.accept();
+                } catch (IOException e) {
+                    if (cancelled.get()) {
+                        if (D) Log.d(TAG, "Socket accept() was cancelled");
+                        return;
+                    }
+
+                    Log.e(TAG, "Socket accept() method failed", e);
+                    listener.onError(e);
+                    break;
+                }
+
+                if (socket != null) {
+                    // A connection was accepted. Perform work associated with
+                    // the connection in a separate thread.
+                    device = socket.getRemoteDevice();
+                    connectionSuccess(socket, device);
+                    try {
+                        mmServerSocket.close();
+                    } catch (IOException e) {
+                        Log.e(TAG, "Could not close the connect socket", e);
+                        listener.onError(e);
+                        }
+                    break;
+                }
+            }
+        }
+
+        // Closes the connect socket and causes the thread to finish.
+        public void cancel() {
+            cancelled.set(true);
+            try {
+                mmServerSocket.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Could not close the connect socket", e);
+                listener.onError(e);
+            }
+        }
+    }
+
 
     /**
      * ConnectedThread runs throughout a device connection/registration.  It's responsible for
@@ -338,7 +437,7 @@ public class RNBluetoothClassicService {
                 tmpOut = socket.getOutputStream();
             } catch (Exception e) {
                 Log.e(TAG, "temp sockets not created", e);
-                mModule.onError(e);
+                listener.onError(e);
             }
 
             mmInStream = tmpIn;
@@ -356,20 +455,15 @@ public class RNBluetoothClassicService {
             // flag.
             while (!mmCancelled) {
                 try {
-                    if (mmInStream.available() > 0) {
-                        bytes = mmInStream.read(buffer); // Read from the InputStream
-                        String data = new String(buffer, 0, bytes, mCharSet);
-                        mModule.onData(data); // Send new data to the module to handle
-                    }
-
-                    Thread.sleep(500);      // Pause
+                    bytes = mmInStream.read(buffer);
+                    listener.onReceivedData(mmDevice, Arrays.copyOf(buffer, bytes));                    
+                    
+                    //Thread.sleep(500);      // Pause
                 } catch (Exception e) {
                     Log.e(TAG, "Disconnected", e);
 
                     if (!mmCancelled) {
-                        // We didn't cancel the Thread so something else happened
-                        mModule.onError(e);
-                        connectionLost(mmDevice);
+                        connectionLost(mmDevice, e);
                         RNBluetoothClassicService.this.stop(); // Start the service over to restart listening mode
                     }
 
@@ -397,7 +491,7 @@ public class RNBluetoothClassicService {
                 mmOutStream.write(str.getBytes());
             } catch (Exception e) {
                 Log.e(TAG, "Exception during write", e);
-                mModule.onError(e);
+                listener.onError(e);
             }
         }
 
